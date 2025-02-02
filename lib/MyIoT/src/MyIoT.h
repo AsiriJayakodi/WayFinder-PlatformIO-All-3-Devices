@@ -2,7 +2,7 @@
 #define MYIOT_H
 
 #include <Arduino.h> // Include Arduino core functions
-
+#include <string.h>  // Include string functions
 class MyIoT {
   public:
     MyIoT(int pin); // Constructor

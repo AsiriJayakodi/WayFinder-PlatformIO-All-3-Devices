@@ -16,3 +16,4 @@ pio run -e base -t upload
 ```
 
 This setup keeps everything in one project while managing different firmware for each board. Let me know if you need refinements! 🚀
+
