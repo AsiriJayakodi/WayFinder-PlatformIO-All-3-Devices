@@ -6,7 +6,19 @@
 #include <string>
 #include <Wire.h>
 
-// ----- Predefined Emergency Messages -----
+// ----- Message Command Definitions -----
+enum MessageType {
+  PREDEFINED,
+  CUSTOM
+};
+
+struct MessageCommand {
+  MessageType type;
+  int predefinedID;   // Valid if type == PREDEFINED
+  String customText;  // Valid if type == CUSTOM
+};
+
+// ----- User Emergency Messages (sent from user to base) -----
 // Using C-strings for Arduino compatibility.
 const char* emergencyMessages[10] = {
   "I'm OK",
@@ -21,7 +33,21 @@ const char* emergencyMessages[10] = {
   "Send my location to the rescue team"
 };
 
-// Helper function to return a message as an Arduino String.
+// ----- Base Station Messages (sent from base to user) -----
+const char* baseMessages[10] = {
+  "All clear",
+  "Evacuate immediately",
+  "Proceed to checkpoint",
+  "Remain calm",
+  "Await further instructions",
+  "Medical team is en route",
+  "Rescue team dispatched",
+  "Help is arriving",
+  "Situation under control",
+  "Mission accomplished"
+};
+
+// Helper function to return a user emergency message as an Arduino String.
 // Expects a 1-based index, converts it to 0-based.
 String getMessage(int index) {
   int adjustedIndex = index - 1;
@@ -32,10 +58,19 @@ String getMessage(int index) {
   }
 }
 
+// Helper function to return a base station message as an Arduino String.
+// Expects a 1-based index, converts it to 0-based.
+String getBaseMessage(int index) {
+  int adjustedIndex = index - 1;
+  if (adjustedIndex >= 0 && adjustedIndex < 10) {
+    return String(baseMessages[adjustedIndex]);
+  } else {
+    return "Invalid index! Please enter a number between 1 and 10.";
+  }
+}
+
 // ----- Helper Function for RSSI Status -----
-// This function classifies the RSSI value into one of four statuses.
 String getRSSIStatus(int rssi) {
-  // Adjust these thresholds as needed:
   if (rssi > -65) return "Excellent";
   else if (rssi > -75) return "Good";
   else if (rssi > -85) return "Fair";
@@ -43,19 +78,18 @@ String getRSSIStatus(int rssi) {
 }
 
 // ----- LoRa Module Pin Definitions -----
-const int csPin    = 5;    // Chip Select
-const int resetPin = 14;   // Reset
-const int irqPin   = 2;    // IRQ (DIO0)
+const int csPin    = 5;
+const int resetPin = 14;
+const int irqPin   = 2;
 
-// Frequency for the SX1278 (typically 433E6 in many regions)
+// Frequency for the SX1278
 const long frequency = 433E6;
 
 // ----- Global Instance of PayloadBuilder -----
-// (Assumes your library’s class is named PayloadBuilder)
 PayloadBuilder payloadBuilder;
 
 // ----- FreeRTOS Queue Handle -----
-// This queue will pass an integer (the msgID) from the serial task to the transmit task.
+// Updated to hold MessageCommand structures.
 QueueHandle_t msgQueue;
 
 // --------------------------------------------------------
@@ -70,11 +104,9 @@ void LoRaReceiveTask(void* pvParameters) {
         payload.push_back(LoRa.read());
       }
       
-      // Identify payload type and check checksum using your library function.
       uint8_t type = payloadBuilder.identify_type_and_check_checksum(payload);
 
       if (type == 0x01) {  // GPS Payload
-        // Decode GPS data and general payload details.
         PayloadBuilder::GPSData gpsData = payloadBuilder.decode_gps_payload(payload);
         PayloadBuilder::PayloadDetails details = payloadBuilder.get_payload_details(payload);
         
@@ -106,10 +138,8 @@ void LoRaReceiveTask(void* pvParameters) {
           Serial.print(" ");
         }
         Serial.println();
-        // pMsgData.msgID is stored as 0-based, so add 1 for display.
         int displayMsgID = pMsgData.msgID + 1;
         Serial.print("Message ID: "); Serial.println(displayMsgID);
-        // Get the corresponding message text.
         String receivedMsgText = getMessage(displayMsgID);
         Serial.print("Message Text: "); Serial.println(receivedMsgText);
         Serial.println("---------------------------------------------");
@@ -135,8 +165,6 @@ void LoRaReceiveTask(void* pvParameters) {
         Serial.println("Received unknown payload or checksum error.");
       }
       
-      // ----- RSSI Reporting -----
-      // Retrieve the RSSI value for this packet and classify it.
       int rssi = LoRa.packetRssi();
       String rssiStatus = getRSSIStatus(rssi);
       Serial.print("RSSI: ");
@@ -145,15 +173,13 @@ void LoRaReceiveTask(void* pvParameters) {
       Serial.println(rssiStatus);
       Serial.println();
     }
-    // Small delay to yield to other tasks.
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
 // --------------------------------------------------------
 // Task 2: Serial Input Task
-// Waits for user input from the Serial Monitor. When a number is entered,
-// it is sent via a queue to the transmit task.
+// Updated to accept both predefined commands and custom messages.
 // --------------------------------------------------------
 void SerialInputTask(void* pvParameters) {
   for (;;) {
@@ -161,10 +187,19 @@ void SerialInputTask(void* pvParameters) {
       String input = Serial.readStringUntil('\n');
       input.trim();
       if (input.length() > 0) {
-        int msgID = input.toInt();
-        // Send the msgID to the queue
-        if (xQueueSend(msgQueue, &msgID, portMAX_DELAY) != pdPASS) {
-          Serial.println("Failed to send msgID to queue");
+        MessageCommand cmd;
+        // If input starts with "C:" treat it as a custom message.
+        if (input.startsWith("C:") || input.startsWith("c:")) {
+          cmd.type = CUSTOM;
+          cmd.customText = input.substring(2);
+          cmd.customText.trim();
+        } else {
+          // Otherwise, treat input as a predefined message number.
+          cmd.type = PREDEFINED;
+          cmd.predefinedID = input.toInt();
+        }
+        if (xQueueSend(msgQueue, &cmd, portMAX_DELAY) != pdPASS) {
+          Serial.println("Failed to send message command to queue");
         }
       }
     }
@@ -174,32 +209,32 @@ void SerialInputTask(void* pvParameters) {
 
 // --------------------------------------------------------
 // Task 3: LoRa Transmit Task
-// Waits on the queue for a msgID from the Serial Input Task. When received,
-// it creates a predefined message payload and transmits it over LoRa.
+// Now handles both predefined and custom messages.
 // --------------------------------------------------------
 void LoRaTransmitTask(void* pvParameters) {
-  uint16_t transmissionID = 0; // Increment with each message sent
-  int msgID;
+  uint16_t transmissionID = 0;
+  MessageCommand cmd;
   for (;;) {
-    // Wait indefinitely until a msgID is received.
-    if (xQueueReceive(msgQueue, &msgID, portMAX_DELAY) == pdPASS) {
-      // Create the predefined message payload using your library.
-      // Note: The payload builder expects a 0-based msgID, so subtract 1 from the user-entered msgID.
-      std::vector<uint8_t> txPayload = payloadBuilder.create_p_msg_payload(transmissionID, (uint8_t)(msgID - 1));
+    if (xQueueReceive(msgQueue, &cmd, portMAX_DELAY) == pdPASS) {
+      std::vector<uint8_t> txPayload;
+      if (cmd.type == PREDEFINED) {
+        txPayload = payloadBuilder.create_p_msg_payload(transmissionID, (uint8_t)(cmd.predefinedID - 1));
+        String msgText = getBaseMessage(cmd.predefinedID);
+        Serial.print("Transmitted base predefined message with msgID: ");
+        Serial.print(cmd.predefinedID);
+        Serial.print(" - ");
+        Serial.println(msgText);
+      } else if (cmd.type == CUSTOM) {
+        txPayload = payloadBuilder.create_c_msg_payload(transmissionID, std::string(cmd.customText.c_str()));
+        Serial.print("Transmitted custom message: ");
+        Serial.println(cmd.customText);
+      }
       
-      // Transmit the payload via LoRa.
       LoRa.beginPacket();
       for (uint8_t byte : txPayload) {
         LoRa.write(byte);
       }
       LoRa.endPacket();
-      
-      // Retrieve the corresponding emergency message for display.
-      String msgText = getMessage(msgID);
-      Serial.print("Transmitted predefined message with msgID: ");
-      Serial.print(msgID);
-      Serial.print(" - ");
-      Serial.println(msgText);
       
       transmissionID++;
     }
@@ -208,80 +243,45 @@ void LoRaTransmitTask(void* pvParameters) {
 }
 
 // --------------------------------------------------------
-// Setup: Initialize Serial, LoRa, the PayloadBuilder, queue, tasks, and print predefined messages.
+// Setup: Print base station messages and initialize modules and tasks.
 // --------------------------------------------------------
 void setup() {
   Serial.begin(9600);
-  while (!Serial); // Wait for the Serial Monitor
+  while (!Serial);
   
   Serial.println("Base Station Starting...");
   
-  // Print the predefined emergency messages for reference.
-  Serial.println("Predefined Emergency Messages:");
+  Serial.println("Base Station Predefined Messages:");
   for (int i = 0; i < 10; i++) {
-    Serial.print(i + 1); // Display messages numbered from 1 to 10.
+    Serial.print(i + 1);
     Serial.print(": ");
-    Serial.println(emergencyMessages[i]);
+    Serial.println(baseMessages[i]);
   }
-  Serial.println("Enter the number (1-10) of the message you want to transmit:");
-
-  // Initialize LoRa module
+  Serial.println("Enter a number (1-10) for a predefined base message or");
+  Serial.println("enter a custom message with the prefix \"C:\" to transmit:");
+  
   LoRa.setPins(csPin, resetPin, irqPin);
   if (!LoRa.begin(frequency)) {
     Serial.println("LoRa init failed. Check connections.");
     while (1);
   }
   Serial.println("LoRa init succeeded.");
-
-  // Configure your PayloadBuilder with device IDs.
-  // For example: source = 0x02 (base station), destination = 0x01 (target device)
+  
   payloadBuilder.configure_device(0x02, 0x01);
-
-  // Create a queue for sending msgIDs (queue length = 10, size = int)
-  msgQueue = xQueueCreate(10, sizeof(int));
+  
+  msgQueue = xQueueCreate(10, sizeof(MessageCommand));
   if (msgQueue == NULL) {
     Serial.println("Failed to create message queue.");
     while (1);
   }
-
-  // Create the three tasks.
-  // Task: LoRa Receive (runs on core 1)
-  xTaskCreatePinnedToCore(
-    LoRaReceiveTask,       // Task function
-    "LoRaReceiveTask",     // Name of task
-    4096,                  // Stack size in words
-    NULL,                  // Task input parameter
-    1,                     // Priority
-    NULL,                  // Task handle
-    1                      // Core where the task should run
-  );
-
-  // Task: Serial Input (runs on core 0)
-  xTaskCreatePinnedToCore(
-    SerialInputTask,
-    "SerialInputTask",
-    2048,
-    NULL,
-    1,
-    NULL,
-    0
-  );
-
-  // Task: LoRa Transmit (runs on core 0)
-  xTaskCreatePinnedToCore(
-    LoRaTransmitTask,
-    "LoRaTransmitTask",
-    4096,
-    NULL,
-    1,
-    NULL,
-    0
-  );
+  
+  xTaskCreatePinnedToCore(LoRaReceiveTask, "LoRaReceiveTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(SerialInputTask, "SerialInputTask", 2048, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(LoRaTransmitTask, "LoRaTransmitTask", 4096, NULL, 1, NULL, 0);
 }
 
 // --------------------------------------------------------
 // loop(): Empty since all operations are handled by tasks.
 // --------------------------------------------------------
 void loop() {
-  // Nothing needed here.
 }
